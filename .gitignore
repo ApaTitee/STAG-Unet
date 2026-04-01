@@ -1,0 +1,13 @@
+# 数据集和模型权重
+data/
+*.pth
+*.pt
+*.h5
+
+# Python 缓存和环境
+__pycache__/
+.ipynb_checkpoints/
+.env/
+
+# VSCode 配置
+.vscode/
