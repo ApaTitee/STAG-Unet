@@ -25,3 +25,6 @@ tensorboard/
 *.save
 *.tmp
 .DS_Store
+
+# Codex 执行报告
+IMPLEMENTATION_REPORT/
