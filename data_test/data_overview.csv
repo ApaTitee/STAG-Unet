@@ -1,4 +1,0 @@
-patient_id,wsi_id,name,source,specimen_type,scanner,wsi_path,annotation_mask_path,annotation_xml_path,annotation_json_path,split,validation_fold
-test_patient_1,wsi1,test_wsi_1,test,biopsy,synthetic,images/development/wsis/test_wsi_1.tif,annotations/masks/test_wsi_1.tif,annotations/xmls/test_wsi_1.xml,annotations/jsons/test_wsi_1.json,development,0
-test_patient_2,wsi1,test_wsi_2,test,biopsy,synthetic,images/development/wsis/test_wsi_2.tif,annotations/masks/test_wsi_2.tif,annotations/xmls/test_wsi_2.xml,annotations/jsons/test_wsi_2.json,development,1
-test_patient_3,wsi1,test_wsi_3,test,biopsy,synthetic,images/development/wsis/test_wsi_3.tif,annotations/masks/test_wsi_3.tif,annotations/xmls/test_wsi_3.xml,annotations/jsons/test_wsi_3.json,development,2

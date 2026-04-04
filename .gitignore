@@ -1,13 +1,27 @@
 # 数据集和模型权重
 data/
+data_test/
+raw_data/
 *.pth
 *.pt
 *.h5
 
 # Python 缓存和环境
 __pycache__/
+*.pyc
 .ipynb_checkpoints/
 .env/
 
 # VSCode 配置
 .vscode/
+
+# 运行输出与日志
+outputs/
+logs/
+tensorboard/
+*.log
+
+# 临时文件
+*.save
+*.tmp
+.DS_Store
