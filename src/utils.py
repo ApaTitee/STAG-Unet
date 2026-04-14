@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
+from xml.etree import ElementTree as ET
 
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import openslide
+
+try:
+	import tifffile
+except Exception:  # pragma: no cover - optional dependency
+	tifffile = None
 
 
 # BEETLE WSIs/masks are gigapixel TIFFs; allow opening trusted large images.
@@ -37,6 +45,13 @@ class PatchConfig:
 	@property
 	def stride(self) -> int:
 		return max(1, int(self.patch_size * (1.0 - self.overlap)))
+
+
+@dataclass(frozen=True)
+class AnnotationPolygon:
+	label: int
+	points: tuple[tuple[float, float], ...]
+	bounding_box: tuple[float, float, float, float]
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -110,6 +125,102 @@ def read_rgb_region(path: str | Path, x: int, y: int, size: int) -> np.ndarray:
 		image = image.convert("RGB")
 		crop = image.crop((int(x), int(y), int(x + size), int(y + size)))
 		return np.asarray(crop)
+
+
+def read_mask_array(path: str | Path) -> np.ndarray:
+	try:
+		with Image.open(path) as image:
+			mask = np.asarray(image)
+	except Exception:
+		if tifffile is None:
+			raise
+		mask = tifffile.imread(str(path))
+	if mask.ndim == 3:
+		mask = mask[..., 0]
+	return mask
+
+
+
+@lru_cache(maxsize=8)
+def load_label_map(label_map_path: str | Path) -> dict[str, int]:
+	with open(label_map_path, "r", encoding="utf-8") as file_handle:
+		label_map = json.load(file_handle)
+	return {str(key): int(value) for key, value in label_map.items()}
+
+
+def _default_label_map_path(annotation_path: str | Path) -> Path:
+	path = Path(annotation_path)
+	return path.parents[1] / "label_map.json"
+
+
+@lru_cache(maxsize=512)
+def load_annotation_polygons(annotation_path: str | Path) -> tuple[AnnotationPolygon, ...]:
+	path = Path(annotation_path)
+	label_map = load_label_map(_default_label_map_path(path))
+	polygons: list[AnnotationPolygon] = []
+
+	if path.suffix.lower() == ".json":
+		with path.open("r", encoding="utf-8") as file_handle:
+			entries = json.load(file_handle)
+		for entry in entries:
+			coordinates = entry.get("coordinates") or []
+			if len(coordinates) < 3:
+				continue
+			label_info = entry.get("label") or {}
+			label_value = label_info.get("value")
+			if label_value is None:
+				label_name = str(label_info.get("name", "unannotated"))
+				label_value = label_map.get(label_name, 0)
+			points = tuple((float(x_coord), float(y_coord)) for x_coord, y_coord in coordinates)
+			xs = [point[0] for point in points]
+			ys = [point[1] for point in points]
+			polygons.append(
+				AnnotationPolygon(
+					label=int(label_value),
+					points=points,
+					bounding_box=(min(xs), min(ys), max(xs), max(ys)),
+				)
+			)
+		return tuple(polygons)
+
+	if path.suffix.lower() == ".xml":
+		root = ET.parse(path).getroot()
+		for annotation in root.findall(".//Annotation"):
+			group_name = str(annotation.attrib.get("PartOfGroup", "unannotated"))
+			label_value = int(label_map.get(group_name, 0))
+			coordinates: list[tuple[float, float]] = []
+			for coordinate in annotation.findall(".//Coordinate"):
+				x_coord = float(coordinate.attrib.get("X", 0.0))
+				y_coord = float(coordinate.attrib.get("Y", 0.0))
+				coordinates.append((x_coord, y_coord))
+			if len(coordinates) < 3:
+				continue
+			points = tuple(coordinates)
+			xs = [point[0] for point in points]
+			ys = [point[1] for point in points]
+			polygons.append(
+				AnnotationPolygon(
+					label=label_value,
+					points=points,
+					bounding_box=(min(xs), min(ys), max(xs), max(ys)),
+				)
+			)
+		return tuple(polygons)
+
+	raise ValueError(f"Unsupported annotation format: {path.suffix}")
+
+
+def read_annotation_region(annotation_path: str | Path, x: int, y: int, size: int) -> np.ndarray:
+	canvas = Image.new("L", (int(size), int(size)), 0)
+	draw = ImageDraw.Draw(canvas)
+	region_box = (int(x), int(y), int(x + size), int(y + size))
+	for polygon in load_annotation_polygons(annotation_path):
+		left, top, right, bottom = polygon.bounding_box
+		if right < region_box[0] or bottom < region_box[1] or left > region_box[2] or top > region_box[3]:
+			continue
+		translated_points = [(point_x - x, point_y - y) for point_x, point_y in polygon.points]
+		draw.polygon(translated_points, fill=int(polygon.label))
+	return np.asarray(canvas)
 
 
 def read_mask_region(path: str | Path, x: int, y: int, size: int) -> np.ndarray:

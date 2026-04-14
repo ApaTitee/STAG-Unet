@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from src.dataset import (  # noqa: E402
 	build_dataloader,
 	build_eval_transform,
 	build_patch_records,
+	build_patch_records_from_manifest,
 	build_sampler,
 	build_train_transform,
 	split_records_by_fold,
@@ -30,9 +32,12 @@ from src.utils import PatchConfig, ensure_dir, dice_score, set_seed  # noqa: E40
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Train STAG-Unet on BEETLE patches.")
-	parser.add_argument("--csv-path", type=str, default="data/data_overview.csv")
-	parser.add_argument("--data-root", type=str, default="data")
-	parser.add_argument("--output-dir", type=str, default="outputs")
+	parser.add_argument("--csv-path", type=str, default=None)
+	parser.add_argument("--data-root", type=str, default=None)
+	parser.add_argument("--output-dir", type=str, default=None)
+	parser.add_argument("--cache-root", type=str, default=None)
+	parser.add_argument("--use-cache-manifest", action="store_true")
+	parser.add_argument("--cache-only", action="store_true")
 	parser.add_argument("--epochs", type=int, default=100)
 	parser.add_argument("--batch-size", type=int, default=4)
 	parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -43,12 +48,38 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--num-workers", type=int, default=4)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--num-classes", type=int, default=5)
+	parser.add_argument("--patch-sampling-rate", type=float, default=0.05)
+	parser.add_argument("--use-stratified-sampling", action="store_true")
+	parser.add_argument("--max-patch-candidates-per-wsi", type=int, default=256)
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--max-wsis", type=int, default=None)
 	parser.add_argument("--skip-blank", action="store_true")
 	parser.add_argument("--pretrained", action="store_true")
 	parser.add_argument("--no-pretrained", action="store_true")
+	parser.add_argument("--early-stopping-patience", type=int, default=None)
 	return parser.parse_args()
+
+
+def _resolve_path(cli_value: str | None, env_var: str, fallback: str) -> Path:
+	value = cli_value or os.getenv(env_var) or fallback
+	return Path(value).expanduser().resolve()
+
+
+def _prepare_runtime_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+	csv_path = _resolve_path(args.csv_path, "STAG_CSV_PATH", "data/data_overview.csv")
+	data_root = _resolve_path(args.data_root, "STAG_DATA_ROOT", "data")
+	output_dir = _resolve_path(args.output_dir, "STAG_OUTPUT_DIR", "outputs")
+
+	if not csv_path.exists():
+		raise FileNotFoundError(
+			f"CSV not found: {csv_path}. Use --csv-path or set STAG_CSV_PATH to fix this."
+		)
+	if not data_root.exists() or not data_root.is_dir():
+		raise FileNotFoundError(
+			f"Data root not found: {data_root}. Use --data-root or set STAG_DATA_ROOT to fix this."
+		)
+
+	return csv_path, data_root, output_dir
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, epochs: int, warmup_epochs: int) -> SequentialLR:
@@ -100,8 +131,20 @@ def train_fold(args: argparse.Namespace, records, fold_index: int) -> dict[str, 
 
 	train_records, val_records = split_records_by_fold(records, fold_index)
 	patch_config = PatchConfig()
-	train_dataset = WSIPatchDataset(train_records, patch_size=patch_config.patch_size, transform=build_train_transform())
-	val_dataset = WSIPatchDataset(val_records, patch_size=patch_config.patch_size, transform=build_eval_transform())
+	train_dataset = WSIPatchDataset(
+		train_records,
+		patch_size=patch_config.patch_size,
+		transform=build_train_transform(),
+		cache_root=args.cache_root,
+		cache_only=args.cache_only,
+	)
+	val_dataset = WSIPatchDataset(
+		val_records,
+		patch_size=patch_config.patch_size,
+		transform=build_eval_transform(),
+		cache_root=args.cache_root,
+		cache_only=args.cache_only,
+	)
 
 	train_loader = build_dataloader(
 		train_dataset,
@@ -123,6 +166,7 @@ def train_fold(args: argparse.Namespace, records, fold_index: int) -> dict[str, 
 	scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
 
 	best_val_loss = float("inf")
+	epochs_without_improvement = 0
 	history: dict[str, float] = {}
 
 	for epoch in range(1, args.epochs + 1):
@@ -141,15 +185,35 @@ def train_fold(args: argparse.Namespace, records, fold_index: int) -> dict[str, 
 
 		if val_loss < best_val_loss:
 			best_val_loss = val_loss
+			epochs_without_improvement = 0
 			torch.save({"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict()}, output_dir / "best.pt")
+		else:
+			epochs_without_improvement += 1
+
+		print(
+			f"[epoch {epoch:03d}/{args.epochs:03d}] "
+			f"train_loss={train_loss:.6f} train_dice={train_dice:.6f} "
+			f"val_loss={val_loss:.6f} val_dice={val_dice:.6f} best_val_loss={best_val_loss:.6f}",
+			flush=True,
+		)
 
 		history = {
+			"epoch": epoch,
 			"train_loss": train_loss,
 			"train_dice": train_dice,
 			"val_loss": val_loss,
 			"val_dice": val_dice,
 			"best_val_loss": best_val_loss,
 		}
+
+		if args.early_stopping_patience is not None and args.early_stopping_patience > 0:
+			if epochs_without_improvement >= args.early_stopping_patience:
+				print(
+					f"[early_stopping] stop at epoch {epoch}: no val_loss improvement for "
+					f"{epochs_without_improvement} epochs (patience={args.early_stopping_patience})",
+					flush=True,
+				)
+				break
 
 	writer.close()
 	return history
@@ -158,22 +222,54 @@ def train_fold(args: argparse.Namespace, records, fold_index: int) -> dict[str, 
 def main() -> None:
 	args = parse_args()
 	set_seed(args.seed)
+	csv_path, data_root, output_dir = _prepare_runtime_paths(args)
 
-	patch_config = PatchConfig()
-	records = build_patch_records(
-		csv_path=args.csv_path,
-		data_root=args.data_root,
-		patch_config=patch_config,
-		split="development",
-		num_folds=args.num_folds,
-		skip_blank=args.skip_blank,
-		max_wsis=args.max_wsis,
-	)
+	is_slurm_job = bool(os.getenv("SLURM_JOB_ID"))
+	if not is_slurm_job:
+		raise RuntimeError(
+			"Training must be launched from a SLURM job. Use sbatch scripts/train.slurm or sbatch scripts/train_5fold_cached.slurm."
+		)
+
+	args.csv_path = str(csv_path)
+	args.data_root = str(data_root)
+	args.output_dir = str(output_dir)
+
+	print(f"[runtime] csv_path={args.csv_path}")
+	print(f"[runtime] data_root={args.data_root}")
+	print(f"[runtime] output_dir={args.output_dir}")
+
+	if args.use_cache_manifest:
+		if args.cache_root is None:
+			raise ValueError("--use-cache-manifest requires --cache-root.")
+		records = build_patch_records_from_manifest(
+			cache_root=args.cache_root,
+			csv_path=args.csv_path,
+			data_root=args.data_root,
+			split="development",
+			num_folds=args.num_folds,
+		)
+		print(f"[runtime] records_source=manifest records={len(records)}")
+	else:
+		patch_config = PatchConfig()
+		records = build_patch_records(
+			csv_path=args.csv_path,
+			data_root=args.data_root,
+			patch_config=patch_config,
+			split="development",
+			num_folds=args.num_folds,
+			skip_blank=args.skip_blank,
+			max_wsis=args.max_wsis,
+			patch_sampling_rate=args.patch_sampling_rate,
+			use_stratified_sampling=args.use_stratified_sampling,
+			max_patch_candidates_per_wsi=args.max_patch_candidates_per_wsi,
+			random_seed=args.seed,
+		)
+		print(f"[runtime] records_source=build_patch_records records={len(records)}")
 
 	if not records:
 		raise RuntimeError(
 			"No patch records were generated. This usually means required WSI/mask files are missing. "
-			"Verify data/images/development/wsis and data/annotations/masks are populated, then re-run training."
+			f"Verify {args.data_root}/images/development/wsis and {args.data_root}/annotations/masks are populated, then re-run training."
 		)
 
 	if args.fold < 0 or args.fold >= args.num_folds:
