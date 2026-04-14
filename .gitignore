@@ -14,6 +14,7 @@ __pycache__/
 
 # VSCode 配置
 .vscode/
+*.code-workspace
 
 # 运行输出与日志
 outputs/
@@ -28,3 +29,10 @@ tensorboard/
 
 # Codex 执行报告
 IMPLEMENTATION_REPORT/
+reference/
+
+# 本地归档区
+archive/
+
+# Sbatch 运行脚本
+scripts/

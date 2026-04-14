@@ -181,19 +181,17 @@ EfficientNet-B0 被选为骨干网络，原因包括：
 
 ### 8.3 多卡训练
 
-当前阶段暂不考虑多卡分布式训练，优先保证单机单卡环境下的流程可运行与结果可复现。
+在 HKUST HPC4 的 RTX5880 Ada 显卡集群上进行训练。
 
 ## 9. 当前实现状态
 
-从代码结构来看，当前项目仍处于设计和规划阶段，核心源文件包括：
+从代码结构来看，当前项目仍处于设计规划与可行性验证阶段，核心源文件包括：
 
 1. dataset.py
 2. model.py
 3. loss.py
 4. train.py
 5. utils.py
-
-这些文件尚未形成完整实现，因此当前报告更接近于项目方案说明和最小可行实现定义，而不是成熟实验结果汇总。
 
 ## 10. 最小可行方案总结
 
@@ -225,3 +223,110 @@ EfficientNet-B0 被选为骨干网络，原因包括：
 3. 增加可复现性控制，包括随机种子、配置文件和日志记录。
 4. 若后续追求更严谨的泛化评估，建议增加 patient-level 或 slide-level 对照实验。
 5. 若有时间，再扩展消融实验，对比是否使用 Macenko、CBAM 和不同 backbone 的效果。
+
+## 13. HPC4 运行说明（路径与调度）
+
+### 13.1 基本约定
+
+1. 通过 SSH 登录后默认在 login 节点。
+2. login 节点仅用于短时交互式测试，不建议执行大规模训练。
+3. 正式训练请使用 SLURM 提交作业。
+4. 推荐 conda 环境：`stag_env`。
+
+### 13.2 关键路径
+
+推荐将真实数据根目录设置为：
+
+1. `/scratch/jchengaw/data`
+2. CSV：`/scratch/jchengaw/data/data_overview.csv`
+
+训练脚本 `src/train.py` 支持以下优先级：
+
+1. CLI 参数（`--csv-path`, `--data-root`, `--output-dir`）
+2. 环境变量（`STAG_CSV_PATH`, `STAG_DATA_ROOT`, `STAG_OUTPUT_DIR`）
+3. 代码默认值（`data/data_overview.csv`, `data`, `outputs`）
+
+### 13.3 login 节点短测命令（仅冒烟）
+
+```bash
+cd /home/jchengaw/STAG-Unet
+bash archive/scripts/testing/smoke_login.sh
+```
+
+或显式覆盖路径：
+
+```bash
+cd /home/jchengaw/STAG-Unet
+CSV_PATH=/scratch/jchengaw/data/data_overview.csv DATA_ROOT=/scratch/jchengaw/data bash archive/scripts/testing/smoke_login.sh
+```
+
+`archive/scripts/testing/smoke_login.sh` 只做路径、数据加载和模型前向检查，不会进入训练循环。
+`src/train.py` 只能在 SLURM 作业中运行；如果在 login 节点直接调用，会立即报错。
+
+### 13.4 SLURM 正式训练
+
+项目提供模板脚本：`scripts/train.slurm`，已包含：
+
+1. `--account=mscbehi5011hpc4`
+2. `--partition=gpu-rtx5880`
+3. `conda activate stag_env`
+
+提交示例：
+
+```bash
+cd /home/jchengaw/STAG-Unet
+sbatch scripts/train.slurm
+```
+
+可通过环境变量覆盖参数：
+
+```bash
+sbatch --export=ALL,FOLD=1,EPOCHS=20,BATCH_SIZE=6,CSV_PATH=/scratch/jchengaw/data/data_overview.csv,DATA_ROOT=/scratch/jchengaw/data scripts/train.slurm
+```
+
+5-fold 并行训练（SLURM array）：
+
+```bash
+cd /home/jchengaw/STAG-Unet
+sbatch scripts/train_5fold_cached.slurm
+```
+
+覆盖参数示例：
+
+```bash
+sbatch --export=ALL,EPOCHS=20,BATCH_SIZE=6,CSV_PATH=/scratch/jchengaw/data/data_overview.csv,DATA_ROOT=/scratch/jchengaw/data,OUTPUT_DIR=/scratch/jchengaw/STAG-Unet/outputs_5fold_cached scripts/train_5fold_cached.slurm
+```
+
+### 13.5 流水线测试脚本
+
+`test_pipeline.py` 也支持路径参数化：
+
+```bash
+python archive/scripts/testing/test_pipeline.py \
+	--csv-path /scratch/jchengaw/data/data_overview.csv \
+	--data-root /scratch/jchengaw/data \
+	--num-folds 5 --max-wsis 3
+```
+
+### 13.6 OpenSlide 依赖检查与修复
+
+先检查环境中是否安装成功：
+
+```bash
+conda run -n stag_env conda list | grep -Ei "openslide|libopenslide|python"
+conda run -n stag_env python -c "import openslide; from openslide import lowlevel; print(openslide.__file__); print(lowlevel._lib)"
+```
+
+若出现 `libopenslide.so` 或 `CXXABI` 相关错误，可在 `stag_env` 中执行：
+
+```bash
+conda install -n stag_env -c conda-forge openslide libstdcxx-ng libgcc-ng
+pip install -U openslide-python
+```
+
+SLURM 训练脚本 `scripts/train.slurm` 已设置：
+
+1. `conda activate stag_env`
+2. `LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}`
+
+这样可以优先使用 conda 环境中的共享库，避免节点系统库版本冲突。
